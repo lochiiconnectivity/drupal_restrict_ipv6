@@ -1,0 +1,183 @@
+--- old/restrict_by_ip/restrict_by_ip.module	2011-02-25 02:08:27.000000000 +0000
++++ new/restrict_by_ip/restrict_by_ip.module	2011-05-24 22:54:52.000000000 +0000
+@@ -17,12 +17,16 @@ function restrict_by_ip_role_check(&$use
+ 	$ip2check = $_SERVER['REMOTE_ADDR'];
+   while ($role = db_fetch_object($result)) {
+ 	$ipaddresses = explode(";", $role->restrict_by_ip_address);
++	$match = FALSE;
+ 	 foreach ($ipaddresses as $ipaddress) {
+-        if (!_restrict_by_ip_cidrcheck($ip2check, $ipaddress)) { 
+-          //unset a role if its not within the allowed ip range for this role
+-          unset($user->roles[$role->rid]);
+-        }	  
+-	}
++          if (_restrict_by_ip_cidrcheck($ip2check, $ipaddress)) {
++		$match = TRUE;
++	  }
++	 }
++	 if ($match == FALSE) {
++		//unset a role if its not within the allowed ip range for this role
++		unset($user->roles[$role->rid]);
++	 }	
+   }
+ }
+ /**
+@@ -221,7 +225,9 @@ function _restrict_by_ip_login(&$user) {
+         watchdog('user', t('Session closed for %name - Invalid IP. '.$ip2check, array('%name' => $user->name)));
+         // Destroy the current session
+         session_destroy();
+-        module_invoke_all('user', 'logout', NULL, $user);
++        // Log user out, can't use module_invoke_all as it has compat issues with php5.3 (see #679404)
++        $null = NULL;
++        user_module_invoke('logout', $null, $user);
+         // Load the anonymous user
+         $user = drupal_anonymous_user();
+         // unset destination required to force them to the ip page during drupal_goto()
+@@ -376,33 +382,32 @@ function _restrict_by_ip_validate_ip( $i
+       $cidr = explode("/", $ipaddress);
+       // Check address and cidr mask entered
+       if (count($cidr) == 2) {
+-        $ipaddr = explode(".", $cidr[0]);
+-        // Check four quads entered
+-        if (count($ipaddr) == 4) {
+-          // Check each quad is valid - numeric and 0 < value < 255
+-          for ($i=0; $i<4; $i++) {
+-            if ((!is_numeric($ipaddr[$i])) || ($ipaddr[$i] < 0) || ($ipaddr[$i] > 255)) {
+-              form_set_error('restrict_by_ip_address', t($sms.'. Illegal value for the an IP Address. Each IP Address must be valid. Check IP Address No. '.$j));
+-              $ret = FALSE;
+-            }
+-          }
+-          // Check cidr mask value - numeric and 0 < value < 33
+-          if((!is_numeric($cidr[1])) || ($cidr[1]<1) || ($cidr[1]>32)) {
+-            form_set_error('restrict_by_ip_address', t($sms.'. Illegal value for the CIDR value. Check CIDR No. '.$j));
+-            $ret = FALSE;
+-          }
++
++	// Check if address is IPv4 address
++        if (preg_match("/\./", $cidr[0])) {
++         if (!_validateIPv4($cidr[0])) {
++   	  form_set_error('restrict_by_ip_address', t($sms.'. IP Address in Incorrect Format. '.$j));
++	  $ret = FALSE;
++         }
+         }
++	// Check if address is IPv6 address
++        elseif  (preg_match("/:/", $cidr[0])) {
++         if (!_validateIPv6($cidr[0])) {
++   	  form_set_error('restrict_by_ip_address', t($sms.'. IPv6 Address in Incorrect Format. '.$j));
++	  $ret = FALSE;
++         }
++        } 
+         else {
+-          form_set_error('restrict_by_ip_address', t($sms.'. IP Address Incorrect Number of Quads. Check IP Address No. '.$j));
++          form_set_error('restrict_by_ip_address', t($sms.'. IP Address in Incorrect Format. '.$j));
+           $ret = FALSE;
+         }
+-      }
+-      else {
+-        form_set_error('restrict_by_ip_address', t($sms.'. IP Address in Incorrect Format. Check IP Address No. '.$j));
++       }
++       else {
++        form_set_error('restrict_by_ip_address', t($sms.'. IP Address in Incorrect Format. '.$j));
+         $ret = FALSE;
+-      }
+-      $j++;
+-    }
++       }
++        $j++;
++     }
+     return $ret;
+ }
+ 
+@@ -411,19 +416,76 @@ function _restrict_by_ip_validate_ip( $i
+  * _restrict_by_ip_cidrcheck('192.168.10.100','192.168.10.0/24'); returns 1
+  * _restrict_by_ip_cidrcheck('192.168.10.100','192.168.12.0/24'); returns 0
+  */ 
++
+ function _restrict_by_ip_cidrcheck($iptocheck, $ipslashcidr) {
+-  // Seperate ip address and cidr mask
+-  $netmask = explode("/", $ipslashcidr);
+-  // Get valid network as long 
+-  $ip_net = ip2long($netmask[0]);
+-  // Get valid network mask as long
+-  $ip_mask = ~((1 << (32 - $netmask[1])) - 1);
+-  // Get ip address to check as long
+-  $ip_ip = ip2long($iptocheck);
+-  // Mask ip address to check to get subnet
+-  $ip_ip_net = $ip_ip & $ip_mask;
+-  // Only returns 1 if the valid network 
+-  //and the subnet of the ip address 
+-  //to check are the same
+-  return ($ip_ip_net == $ip_net);
+-}
+\ No newline at end of file
++
++        list ($ipnet, $mask) = explode("/", $ipslashcidr);
++
++        if (preg_match("/\./", $iptocheck)) {
++                $ip_net = ip2long($ipnet);
++                $ip_mask = ~((1 << (32 - $mask)) - 1);
++                $ip_ip = ip2long($iptocheck);
++                $ip_ip_net = $ip_ip & $ip_mask;
++                return ($ip_ip_net == $ip_net);
++        }
++        elseif  (preg_match("/:/", $iptocheck)) {
++                $ip_ip = inet_pton($iptocheck);
++                $ip_net = inet_pton($ipnet);
++                $len = 8*strlen($ip_net);
++                if ($mask > $len) $mask = $len;
++                $ip_mask = str_repeat('f', $mask>>2);
++                switch($mask & 3) {
++                        case 3: $ip_mask .= 'e'; break;
++                        case 2: $ip_mask .= 'c'; break;
++                        case 1: $ip_mask .= '8'; break;
++                }
++                $ip_mask = str_pad($ip_mask, $len>>2, '0');
++                $ip_mask = pack('H*', $ip_mask);
++                $ip_ip_net = $ip_ip & $ip_mask;
++                return ($ip_ip_net == $ip_net);
++        }
++        else {  
++                return FALSE;
++        }
++
++        return FALSE;
++}
++
++// IP Validation routines, courtesy of Tino Zijdel (http://crisp.tweakblogs.net/)
++
++function _validateIPv4($IP) 
++{ 
++    return $IP == long2ip(ip2long($IP)); 
++} 
++
++function _validateIPv6($IP) 
++{ 
++    // fast exit for localhost 
++    if (strlen($IP) < 3) 
++        return $IP == '::'; 
++
++    // Check if part is in IPv4 format 
++    if (strpos($IP, '.')) 
++    { 
++        $lastcolon = strrpos($IP, ':'); 
++        if (!($lastcolon && validateIPv4(substr($IP, $lastcolon + 1)))) 
++            return false; 
++
++        // replace IPv4 part with dummy 
++        $IP = substr($IP, 0, $lastcolon) . ':0:0'; 
++    } 
++
++    // check uncompressed 
++    if (strpos($IP, '::') === false) 
++    { 
++        return preg_match('/^(?:[a-f0-9]{1,4}:){7}[a-f0-9]{1,4}$/i', $IP); 
++    } 
++
++    // check colon-count for compressed format 
++    if (substr_count($IP, ':') < 8) 
++    { 
++        return preg_match('/^(?::|(?:[a-f0-9]{1,4}:)+):(?:(?:[a-f0-9]{1,4}:)*[a-f0-9]{1,4})?$/i', $IP); 
++    } 
++
++    return false; 
++} 
